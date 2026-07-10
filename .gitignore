@@ -1,0 +1,9 @@
+# 默认忽略所有文件
+*
+
+# 允许上传 .gitignore 本身
+!.gitignore
+
+
+
+!moefedavg.py
