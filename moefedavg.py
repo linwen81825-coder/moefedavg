@@ -6,7 +6,7 @@
     2. routed_count: 按每个客户端对该专家的激活次数加权平均
 
 架构改动 (Fast Top-2 Sparse MoE):
-  1. backbone: ResNet (CIFAR 适配版，无 BatchNorm)
+  1. backbone: ResNet (CIFAR 适配版，GroupNorm)
   2. MoE 路由: 标准 Top-K 路由 (无乘法噪声，无负载均衡)
   3. MoE 计算: 真·稀疏按专家遍历
   4. 损失函数: 纯净交叉熵 (CrossEntropy)
@@ -14,16 +14,29 @@
   6. 训练设置: 关闭 label smoothing，去掉 AutoAugment，仅保留基础增强
 """
 
-import os, copy, argparse, zipfile, urllib.request, gc
+import os, sys, copy, argparse, gc
+from datetime import datetime
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
-from torchvision.datasets import ImageFolder
+
+
+class Tee:
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
 
 
 # ════════════════════════════════════════════════════════
@@ -34,7 +47,7 @@ def get_args():
     p = argparse.ArgumentParser()
 
     p.add_argument('--dataset', default='cifar10',
-                   choices=['cifar10', 'cifar100', 'tinyimagenet', 'femnist'])
+                   choices=['cifar10', 'cifar100'])
     p.add_argument('--beta', type=float, default=0.1)
     p.add_argument('--data_root', default='./data')
 
@@ -71,51 +84,12 @@ def get_args():
 DATASET_CFG = {
     'cifar10':      {'num_classes': 10,  'in_channels': 3, 'img_size': 32},
     'cifar100':     {'num_classes': 100, 'in_channels': 3, 'img_size': 32},
-    'tinyimagenet': {'num_classes': 200, 'in_channels': 3, 'img_size': 64},
-    'femnist':      {'num_classes': 62,  'in_channels': 1, 'img_size': 28},
 }
 
 
 # ════════════════════════════════════════════════════════
 #  数据集
 # ════════════════════════════════════════════════════════
-
-def _prepare_tinyimagenet(root):
-    data_path = os.path.join(root, 'tiny-imagenet-200')
-
-    if not os.path.exists(data_path):
-        url = 'http://cs231n.stanford.edu/tiny-imagenet-200.zip'
-        zip_path = os.path.join(root, 'tiny-imagenet-200.zip')
-
-        print('[Dataset] Downloading TinyImageNet...')
-        urllib.request.urlretrieve(url, zip_path)
-
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(root)
-
-        os.remove(zip_path)
-
-    val_dir = os.path.join(data_path, 'val')
-    anno = os.path.join(val_dir, 'val_annotations.txt')
-    img_dir = os.path.join(val_dir, 'images')
-
-    if os.path.exists(anno):
-        for line in open(anno):
-            parts = line.strip().split('\t')
-            cls_dir = os.path.join(val_dir, parts[1])
-            os.makedirs(cls_dir, exist_ok=True)
-
-            src = os.path.join(img_dir, parts[0])
-            if os.path.exists(src):
-                os.rename(src, os.path.join(cls_dir, parts[0]))
-
-        os.remove(anno)
-
-        if os.path.isdir(img_dir) and not os.listdir(img_dir):
-            os.rmdir(img_dir)
-
-    return data_path
-
 
 def get_dataset(name, data_root):
     os.makedirs(data_root, exist_ok=True)
@@ -140,64 +114,24 @@ def get_dataset(name, data_root):
             torchvision.datasets.CIFAR10(data_root, False, download=True, transform=te),
         )
 
-    elif name == 'cifar100':
-        mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
+    mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
 
-        tr = transforms.Compose([
-            transforms.RandomCrop(32, 4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ])
+    tr = transforms.Compose([
+        transforms.RandomCrop(32, 4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
 
-        te = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ])
+    te = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
 
-        return (
-            torchvision.datasets.CIFAR100(data_root, True, download=True, transform=tr),
-            torchvision.datasets.CIFAR100(data_root, False, download=True, transform=te),
-        )
-
-    elif name == 'tinyimagenet':
-        dp = _prepare_tinyimagenet(data_root)
-        mean, std = (0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)
-
-        tr = transforms.Compose([
-            transforms.RandomCrop(64, 8),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ])
-
-        te = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ])
-
-        return (
-            ImageFolder(os.path.join(dp, 'train'), transform=tr),
-            ImageFolder(os.path.join(dp, 'val'), transform=te),
-        )
-
-    else:
-        tr = te = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,)),
-        ])
-
-        return (
-            torchvision.datasets.EMNIST(
-                data_root, split='byclass',
-                train=True, download=True, transform=tr
-            ),
-            torchvision.datasets.EMNIST(
-                data_root, split='byclass',
-                train=False, download=True, transform=te
-            ),
-        )
-
+    return (
+        torchvision.datasets.CIFAR100(data_root, True, download=True, transform=tr),
+        torchvision.datasets.CIFAR100(data_root, False, download=True, transform=te),
+    )
 
 def partition_dirichlet(dataset, num_clients, beta, seed=42):
     rng = np.random.default_rng(seed)
@@ -231,7 +165,7 @@ def partition_dirichlet(dataset, num_clients, beta, seed=42):
 
 
 # ════════════════════════════════════════════════════════
-#  ResNet Backbone，无 BatchNorm 版本
+#  ResNet Backbone，GroupNorm 版本
 # ════════════════════════════════════════════════════════
 
 class BasicBlock(nn.Module):
@@ -245,6 +179,7 @@ class BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
+        self.gn1 = nn.GroupNorm(8, out_ch)
 
         self.conv2 = nn.Conv2d(
             out_ch, out_ch,
@@ -253,6 +188,7 @@ class BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
+        self.gn2 = nn.GroupNorm(8, out_ch)
 
         self.relu = nn.ReLU(inplace=True)
 
@@ -265,12 +201,13 @@ class BasicBlock(nn.Module):
                     kernel_size=1,
                     stride=stride,
                     bias=False,
-                )
+                ),
+                nn.GroupNorm(8, out_ch),
             )
 
     def forward(self, x):
-        out = self.relu(self.conv1(x))
-        out = self.conv2(out)
+        out = self.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
 
         out = out + self.shortcut(x)
         out = self.relu(out)
@@ -292,6 +229,7 @@ class ResNetBackbone(nn.Module):
                 padding=1,
                 bias=False,
             ),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
         )
 
@@ -630,6 +568,16 @@ def evaluate(model, loader, device):
 def main():
     args = get_args()
 
+    os.makedirs('logs', exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = (
+        f'logs/MoEFedAvg_{args.dataset}_'
+        f'expert_{args.expert_agg}_{timestamp}.log'
+    )
+    log_file = open(log_filename, 'w', encoding='utf-8', buffering=1)
+    sys.stdout = Tee(sys.stdout, log_file)
+    sys.stderr = Tee(sys.stderr, log_file)
+
     if args.device == 'auto':
         device = torch.device(
             'cuda' if torch.cuda.is_available() else
@@ -643,8 +591,14 @@ def main():
 
     cfg = DATASET_CFG[args.dataset]
 
+    print(f'[LogFile] {log_filename}')
+    print('\n[Config]')
+    for key, value in vars(args).items():
+        print(f'{key}: {value}')
+    print(f'resolved_device: {device}')
+
     print(f'\n{"=" * 80}')
-    print(f'  MoE-FedAvg No-BN | NonExpert=Uniform | Expert={args.expert_agg} | Top-{args.topk}')
+    print(f'  MoE-FedAvg | NonExpert=Uniform | Expert={args.expert_agg} | Top-{args.topk}')
     print(f'  Dataset={args.dataset} | beta={args.beta} | Clients={args.num_clients} | Experts={args.num_experts}')
     print(f'  Device={device} | Rounds={args.rounds} | LR={args.lr} (Constant)')
     print(f'{"=" * 80}\n')
@@ -691,8 +645,6 @@ def main():
     m = max(1, int(args.num_clients * args.frac))
 
     best_acc = 0.0
-    history_records = []
-
     print(
         f'{"Round":>5} | {"LR":>7} | {"AvgLoss":>8} | '
         f'{"TestAcc":>8} | {"Best":>8} | {"ExpertRatio":>28}'
@@ -757,20 +709,6 @@ def main():
             f'{acc:>7.2f}% | {best_acc:>7.2f}% | {ratio_str:>28}'
         )
 
-        record = {
-            'Round': rnd,
-            'AvgLoss': avg_loss,
-            'TestAcc': acc,
-            'BestAcc': best_acc,
-            'ExpertAgg': args.expert_agg,
-        }
-
-        for e in range(args.num_experts):
-            record[f'Expert{e}_Count'] = float(round_expert_counts[e])
-            record[f'Expert{e}_Ratio'] = float(round_expert_ratio[e])
-
-        history_records.append(record)
-
         del all_states, all_samples, all_losses, all_expert_counts, new_state
         gc.collect()
 
@@ -778,17 +716,7 @@ def main():
             torch.cuda.empty_cache()
 
     print(f'\nDone. Best Acc: {best_acc:.2f}%')
-
-    excel_filename = (
-        f'MoEFedAvg_NoBN_nonexpert_uniform_'
-        f'expert_{args.expert_agg}_'
-        f'{args.dataset}_clients{args.num_clients}_experts{args.num_experts}.xlsx'
-    )
-
-    df = pd.DataFrame(history_records)
-    df.to_excel(excel_filename, index=False)
-
-    print(f'[Export] 训练数据已成功保存至 Excel 文件: {excel_filename}')
+    print(f'[LogFile] 日志与运行配置已保存至: {log_filename}')
 
 
 if __name__ == '__main__':
