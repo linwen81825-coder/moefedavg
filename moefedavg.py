@@ -14,6 +14,7 @@
   5. 学习率: 固定常数 LR
   6. 训练设置: 关闭 label smoothing，去掉 AutoAugment，仅保留基础增强
   7. 公平评估: 测试集固定划分 1000 张验证集，其余用于最终测试
+  8. 标签噪声: 客户端噪声率独立采样自 Uniform([0,1])，并使用对称标签翻转
 """
 
 import os, sys, copy, argparse, gc, random
@@ -99,34 +100,44 @@ class ExperimentLogger:
 
 def get_args():
     p = argparse.ArgumentParser()
+
     p.add_argument('--dataset', default='cifar10',
                    choices=['cifar10', 'cifar100'])
     p.add_argument('--beta', type=float, default=0.1)
     p.add_argument('--data_root', default='./data')
+    p.add_argument('--label_noise', action='store_true')
+
     p.add_argument('--num_clients', type=int, default=10)
     p.add_argument('--num_experts', type=int, default=4)
     p.add_argument('--topk', type=int, default=2)
+
     # 专家聚合方式:
     # uniform: expert 也普通平均
     # routed_count: expert 按激活次数加权平均
     # meta: 元网络学习每个专家的客户端聚合权重
     p.add_argument('--expert_agg', default='routed_count',
                    choices=['uniform', 'routed_count', 'meta'])
+
     p.add_argument('--rounds', type=int, default=100)
     p.add_argument('--frac', type=float, default=1.0)
     p.add_argument('--local_epochs', type=int, default=1)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--pre_batch_size', type=int, default=128)
+
     p.add_argument('--lr', type=float, default=0.01)
+
     p.add_argument('--momentum', type=float, default=0.9)
     p.add_argument('--weight_decay', type=float, default=1e-4)
+
     p.add_argument('--meta_lr', type=float, default=1e-3)
     p.add_argument('--meta_hidden_dim', type=int, default=16)
     p.add_argument('--meta_val_batch_size', type=int, default=256)
     p.add_argument('--meta_update_steps', type=int, default=1)
+
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default='auto',
                    choices=['auto', 'cpu', 'cuda', 'mps'])
+
     return p.parse_args()
 
 
@@ -216,6 +227,48 @@ def partition_dirichlet(dataset, num_clients, beta, seed=42, logger=None):
     return client_indices
 
 
+def inject_heterogeneous_symmetric_noise(
+        dataset, client_indices, num_classes, seed, logger):
+    """
+    为客户端注入异质对称标签噪声。
+
+    每个客户端 k 的噪声率独立采样：epsilon_k ~ Uniform(0, 1)。
+    对每个样本，以 1-epsilon_k 保留原标签；以 epsilon_k 翻转到
+    其余 num_classes-1 个类别之一，且错误类别等概率。
+    """
+    rng = np.random.default_rng(seed)
+    clean_targets = np.asarray(dataset.targets, dtype=np.int64)
+    noisy_targets = clean_targets.copy()
+    noise_rates = rng.uniform(0.0, 1.0, size=len(client_indices))
+
+    logger.detail(
+        f'[LabelNoise] heterogeneous symmetric | distribution=Uniform([0,1]) | '
+        f'seed={seed}'
+    )
+
+    for cid, indices in enumerate(client_indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        flip_mask = rng.random(indices.size) < noise_rates[cid]
+        flip_indices = indices[flip_mask]
+
+        offsets = rng.integers(1, num_classes, size=flip_indices.size)
+        noisy_targets[flip_indices] = (
+            clean_targets[flip_indices] + offsets
+        ) % num_classes
+
+        actual_rate = flip_indices.size / max(indices.size, 1)
+        logger.detail(
+            f'  Client {cid}: target_rate={noise_rates[cid]:.6f} | '
+            f'actual_rate={actual_rate:.6f} | '
+            f'flipped={flip_indices.size}/{indices.size}'
+        )
+
+    dataset.targets = noisy_targets.tolist()
+    logger.detail()
+
+    return noise_rates
+
+
 def split_validation_test(dataset, seed, logger):
     rng = np.random.default_rng(seed)
     indices = rng.permutation(len(dataset))
@@ -233,7 +286,7 @@ def split_validation_test(dataset, seed, logger):
 
 
 # ════════════════════════════════════════════════════════
-#  ResNet Backbone
+#  ResNet Backbone，GroupNorm 版本
 # ════════════════════════════════════════════════════════
 
 class BasicBlock(nn.Module):
@@ -848,6 +901,18 @@ def main():
         args.seed,
         logger,
     )
+
+    if args.label_noise:
+        inject_heterogeneous_symmetric_noise(
+            dataset=train_ds,
+            client_indices=client_idx,
+            num_classes=cfg['num_classes'],
+            seed=args.seed,
+            logger=logger,
+        )
+    else:
+        logger.detail('[LabelNoise] disabled')
+        logger.detail()
 
     client_subsets = [Subset(train_ds, idx) for idx in client_idx]
 
