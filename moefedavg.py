@@ -35,20 +35,20 @@ class MetaWeightNet(nn.Module):
     每个二维输入只有: [loss, expert_freq]
     输出形状: [num_experts, num_clients]
     """
-    def __init__(self):
+    def __init__(self, hidden_dim=16):
         super().__init__()
 
         self.encoder = nn.Sequential(
-            nn.Linear(2, 16),
+            nn.Linear(2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(16, 16),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
 
         self.scorer = nn.Sequential(
-            nn.Linear(32, 16),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(hidden_dim, 1),
         )
 
         nn.init.zeros_(self.scorer[-1].weight)
@@ -99,40 +99,34 @@ class ExperimentLogger:
 
 def get_args():
     p = argparse.ArgumentParser()
-
     p.add_argument('--dataset', default='cifar10',
                    choices=['cifar10', 'cifar100'])
     p.add_argument('--beta', type=float, default=0.1)
     p.add_argument('--data_root', default='./data')
-
     p.add_argument('--num_clients', type=int, default=10)
     p.add_argument('--num_experts', type=int, default=4)
     p.add_argument('--topk', type=int, default=2)
-
     # 专家聚合方式:
     # uniform: expert 也普通平均
     # routed_count: expert 按激活次数加权平均
     # meta: 元网络学习每个专家的客户端聚合权重
     p.add_argument('--expert_agg', default='routed_count',
                    choices=['uniform', 'routed_count', 'meta'])
-
     p.add_argument('--rounds', type=int, default=100)
     p.add_argument('--frac', type=float, default=1.0)
     p.add_argument('--local_epochs', type=int, default=1)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--pre_batch_size', type=int, default=128)
-
     p.add_argument('--lr', type=float, default=0.01)
-
     p.add_argument('--momentum', type=float, default=0.9)
     p.add_argument('--weight_decay', type=float, default=1e-4)
-
     p.add_argument('--meta_lr', type=float, default=1e-3)
-
+    p.add_argument('--meta_hidden_dim', type=int, default=16)
+    p.add_argument('--meta_val_batch_size', type=int, default=256)
+    p.add_argument('--meta_update_steps', type=int, default=1)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default='auto',
                    choices=['auto', 'cpu', 'cuda', 'mps'])
-
     return p.parse_args()
 
 
@@ -239,7 +233,7 @@ def split_validation_test(dataset, seed, logger):
 
 
 # ════════════════════════════════════════════════════════
-#  ResNet Backbone，GroupNorm 版本
+#  ResNet Backbone
 # ════════════════════════════════════════════════════════
 
 class BasicBlock(nn.Module):
@@ -500,7 +494,11 @@ def collect_pre_stats(global_model, pre_loader, device):
     restore_rng_state(rng_state)
 
     expert_counts = expert_counts.cpu().double()
-    expert_freq = expert_counts / expert_counts.sum().clamp_min(1.0)
+    expert_freq = (
+        expert_counts
+        / expert_counts.sum().clamp_min(1.0)
+        * global_model.moe_head.gating.topk
+    )
 
     del model
 
@@ -555,7 +553,11 @@ def local_train(global_model, train_loader, device, local_epochs, lr,
         torch.cuda.empty_cache()
 
     train_loss = total_batch_loss / max(num_batches, 1)
-    train_expert_freq = expert_counts / expert_counts.sum().clamp_min(1.0)
+    train_expert_freq = (
+        expert_counts
+        / expert_counts.sum().clamp_min(1.0)
+        * global_model.moe_head.gating.topk
+    )
 
     return (
         state,
@@ -713,7 +715,7 @@ def build_temporary_state(fixed_state, expert_stacks, expert_weights):
 
 def update_meta_network(global_model, meta_net, meta_optimizer,
                         client_states, pre_features,
-                        validation_loader, device):
+                        validation_loader, device, update_steps):
     criterion = nn.CrossEntropyLoss()
     fixed_state, expert_stacks = prepare_temporary_parameters(
         global_model,
@@ -723,35 +725,39 @@ def update_meta_network(global_model, meta_net, meta_optimizer,
 
     global_model.eval()
     meta_net.train()
-    meta_optimizer.zero_grad()
 
-    total_loss = 0.0
     total_samples = len(validation_loader.dataset)
+    meta_loss = 0.0
 
-    for x, y in validation_loader:
-        x = x.to(device)
-        y = y.to(device)
+    for _ in range(update_steps):
+        meta_optimizer.zero_grad()
+        total_loss = 0.0
 
-        temporary_weights = meta_net(pre_features)
-        temporary_state = build_temporary_state(
-            fixed_state,
-            expert_stacks,
-            temporary_weights,
-        )
+        for x, y in validation_loader:
+            x = x.to(device)
+            y = y.to(device)
 
-        logits = functional_call(global_model, temporary_state, (x,))
-        loss = criterion(logits, y)
+            temporary_weights = meta_net(pre_features)
+            temporary_state = build_temporary_state(
+                fixed_state,
+                expert_stacks,
+                temporary_weights,
+            )
 
-        batch_ratio = x.size(0) / total_samples
-        (loss * batch_ratio).backward()
+            logits = functional_call(global_model, temporary_state, (x,))
+            loss = criterion(logits, y)
 
-        total_loss += loss.item() * x.size(0)
+            batch_ratio = x.size(0) / total_samples
+            (loss * batch_ratio).backward()
 
-    meta_optimizer.step()
+            total_loss += loss.item() * x.size(0)
+
+        meta_optimizer.step()
+        meta_loss = total_loss / total_samples
 
     del fixed_state, expert_stacks
 
-    return total_loss / total_samples
+    return meta_loss
 
 
 # ════════════════════════════════════════════════════════
@@ -881,7 +887,7 @@ def main():
 
     validation_loader = DataLoader(
         validation_ds,
-        batch_size=256,
+        batch_size=args.meta_val_batch_size,
         shuffle=False,
         num_workers=0,
         pin_memory=True,
@@ -911,7 +917,7 @@ def main():
     meta_optimizer = None
     if args.expert_agg == 'meta':
         rng_state = capture_rng_state()
-        meta_net = MetaWeightNet().to(device)
+        meta_net = MetaWeightNet(args.meta_hidden_dim).to(device)
         restore_rng_state(rng_state)
 
         meta_optimizer = optim.Adam(meta_net.parameters(), lr=args.meta_lr)
@@ -920,8 +926,15 @@ def main():
             f'[MetaNet] Total params: {meta_params:,} | '
             f'Optimizer=Adam | LR={args.meta_lr}'
         )
-        logger.detail('[MetaConfig] raw_input=[loss, expert_freq] | input_dim=2 | hidden_dim=16')
-        logger.detail('[MetaConfig] shared_encoder=True | shared_scorer=True | pooling=mean | update_steps=1')
+        logger.detail(
+            f'[MetaConfig] raw_input=[loss, expert_freq] | input_dim=2 | '
+            f'hidden_dim={args.meta_hidden_dim} | '
+            f'validation_batch_size={args.meta_val_batch_size}'
+        )
+        logger.detail(
+            f'[MetaConfig] shared_encoder=True | shared_scorer=True | '
+            f'pooling=mean | update_steps={args.meta_update_steps}'
+        )
         logger.detail('[MetaConfig] softmax_dim=client | scorer_last_zero_init=True')
         logger.detail()
 
@@ -993,7 +1006,11 @@ def main():
 
         round_expert_counts = all_expert_counts.sum(axis=0)
         round_expert_total = round_expert_counts.sum()
-        round_expert_ratio = round_expert_counts / max(round_expert_total, 1.0)
+        round_expert_ratio = (
+            round_expert_counts
+            / max(round_expert_total, 1.0)
+            * args.topk
+        )
 
         meta_loss = None
         final_meta_weights = None
@@ -1022,6 +1039,7 @@ def main():
                 pre_features=pre_features,
                 validation_loader=validation_loader,
                 device=device,
+                update_steps=args.meta_update_steps,
             )
 
             meta_net.eval()
